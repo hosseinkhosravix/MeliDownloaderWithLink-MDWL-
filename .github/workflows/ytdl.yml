@@ -1,3 +1,4 @@
+
 name: 🎯 YouTube Downloader (Upload)
 
 on:
@@ -402,33 +403,38 @@ jobs:
                   print('❌ Failed'); sys.exit(1)
           PYEOF
 
-      # --- Upload step (no more push) ---
+      # --- Upload step (rewritten for safety) ---
       - name: 📤 Package & Upload to uupload.ir
         run: |
           echo "📦 Creating archive..."
           zip -r melidl_youtube.zip downloads/ playlists/ searches/ 2>/dev/null || echo "Only downloads folder zipped"
 
-          echo "⬆️ Uploading to uupload.ir..."
-          python3 -c "
-import requests, re
-filepath = 'melidl_youtube.zip'
-with open(filepath, 'rb') as f:
-    r = requests.post('https://uupload.ir/', files={'file': (filepath, f)})
-if r.status_code == 200:
-    match = re.search(r'https?://[^\"]*uupload\.ir/[^\"]*', r.text)
-    if match:
-        link = match.group(0)
-        print(f'UPLOAD_LINK={link}')
-        with open('/tmp/upload_link.txt', 'w') as lf:
-            lf.write(link)
-    else:
-        print('Could not extract link. Response snippet:')
-        print(r.text[:500])
-        exit(1)
-else:
-    print(f'Upload failed with status {r.status_code}')
-    exit(1)
-"
+          # Write the upload script to a file
+          cat > /tmp/upload.py << 'UPLOADEOF'
+          import requests, re, sys
+
+          filepath = 'melidl_youtube.zip'
+          with open(filepath, 'rb') as f:
+              r = requests.post('https://uupload.ir/', files={'file': (filepath, f)})
+
+          if r.status_code == 200:
+              match = re.search(r'https?://[^\"]*uupload\.ir/[^\"]*', r.text)
+              if match:
+                  link = match.group(0)
+                  print(f'UPLOAD_LINK={link}')
+                  with open('/tmp/upload_link.txt', 'w') as lf:
+                      lf.write(link)
+              else:
+                  print('Could not extract link. Response snippet:')
+                  print(r.text[:500])
+                  sys.exit(1)
+          else:
+              print(f'Upload failed with status {r.status_code}')
+              sys.exit(1)
+          UPLOADEOF
+
+          python3 /tmp/upload.py
+
           UPLOAD_LINK=$(cat /tmp/upload_link.txt)
           echo "UPLOAD_LINK=$UPLOAD_LINK" >> $GITHUB_ENV
           echo "✅ Uploaded: $UPLOAD_LINK"
