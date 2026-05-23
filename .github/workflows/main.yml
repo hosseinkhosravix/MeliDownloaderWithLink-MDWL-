@@ -1,4 +1,4 @@
-name: 🎯 YouTube Downloader (Upload)
+name: 🎯 YouTube Downloader (Avalai Upload)
 
 on:
   workflow_dispatch:
@@ -39,7 +39,7 @@ on:
         description: '📦 Split > MB (0=no)'
         required: false
         type: number
-        default: 50
+        default: 0   # We skip splitting for Avalai, but keep input for compatibility
 
 env:
   PYTHONUNBUFFERED: '1'
@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: write   # still needed for checkout
 
     steps:
       - uses: actions/checkout@v4
@@ -105,7 +105,7 @@ jobs:
           T = os.environ['TYPE']
           Q = os.environ.get('QUALITY', '720')
           MX = int(os.environ.get('MAX', '10'))
-          SP = int(os.environ.get('SPLIT', '50'))
+          SP = int(os.environ.get('SPLIT', '0'))   # we'll ignore splitting for Avalai
 
           API = 'https://hub.ytconvert.org/api/download'
           H = {
@@ -307,19 +307,6 @@ jobs:
                   print(f'   ❌ Download error: {e}')
               return 0
 
-          def split_file(filepath, threshold_mb):
-              size_mb = filepath.stat().st_size / 1e6
-              if threshold_mb > 0 and size_mb > threshold_mb:
-                  print(f'   ✂️ Splitting ({size_mb:.0f}MB) into {threshold_mb}MB parts...')
-                  parent = filepath.parent
-                  name = filepath.name
-                  subprocess.run(['zip', '-r', '-q', '-s', f'{threshold_mb}m', f'{name}.zip', name], cwd=parent, check=True)
-                  filepath.unlink()
-                  parts = sorted(parent.glob(f'{name}.z*'))
-                  print(f'   ✅ Split into {len(parts)} parts')
-                  return True
-              return False
-
           print(f'{"="*50}')
           print(f'🎬 {M.upper()} MODE')
           print(f'{"="*50}')
@@ -365,7 +352,6 @@ jobs:
                       size = download_file(result['u'], fp)
                       if size:
                           print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
-                          split_file(fp, SP)
                           ok.append(x['t'])
                       else:
                           print('   ❌ Download failed')
@@ -397,47 +383,39 @@ jobs:
                   size = download_file(result['u'], fp)
                   if size:
                       print(f'✅ Saved to {cn}_videos/ ({size/1e6:.1f}MB)')
-                      split_file(fp, SP)
               else:
                   print('❌ Failed'); sys.exit(1)
           PYEOF
 
-      # ─────────────── UPLOAD (completely rewritten, zero YAML issues) ───────────────
-      - name: 📤 Package & Upload to uupload.ir
+      # ─────────────── Package & Upload to Avalai ───────────────
+      - name: 📤 Package & Upload to Avalai
+        env:
+          AVALAI_API_KEY: ${{ secrets.AVALAI_API_KEY }}
         run: |
-          # Create archive
-          zip -r melidl_youtube.zip downloads/ playlists/ searches/ 2>/dev/null || echo "Only downloads folder zipped"
+          echo "📦 Creating zip..."
+          zip -r meli_dl.zip downloads/ playlists/ searches/ 2>/dev/null || echo "Only downloads folder zipped"
 
-          # Write upload script to a temporary file (no inline quotes)
-          cat > /tmp/upload_script.sh << 'SCRIPTEOF'
-          #!/bin/bash
-          python3 - << 'PYTHONEOF'
-          import requests, re, sys
+          echo "⬆️ Uploading to Avalai..."
+          RESPONSE=$(curl -s -X POST "https://api.avalai.ir/v1/files" \
+            -H "Authorization: Bearer $AVALAI_API_KEY" \
+            -F "purpose=assistants" \
+            -F "file=@meli_dl.zip")
 
-          with open('melidl_youtube.zip', 'rb') as f:
-              r = requests.post('https://uupload.ir/', files={'file': ('melidl_youtube.zip', f)})
+          echo "Avalai response: $RESPONSE"
 
-          if r.status_code == 200:
-              match = re.search(r'https?://[^\"]*uupload\.ir/[^\"]*', r.text)
-              if match:
-                  link = match.group(0)
-                  print(link, end='')
-                  sys.exit(0)
-              else:
-                  print('No link found')
-                  sys.exit(1)
-          else:
-              print('Upload failed')
-              sys.exit(1)
-          PYTHONEOF
-          SCRIPTEOF
+          FILE_ID=$(echo "$RESPONSE" | jq -r '.id')
+          if [ -z "$FILE_ID" ] || [ "$FILE_ID" = "null" ]; then
+            echo "❌ Upload failed: no file ID"
+            exit 1
+          fi
 
-          chmod +x /tmp/upload_script.sh
-          UPLOAD_LINK=$(/tmp/upload_script.sh)
-          echo "UPLOAD_LINK=$UPLOAD_LINK" >> $GITHUB_ENV
-          echo "✅ Uploaded: $UPLOAD_LINK"
+          # Build the download URL (content endpoint)
+          DOWNLOAD_URL="https://api.avalai.ir/v1/files/$FILE_ID/content"
+          echo "UPLOAD_LINK=$DOWNLOAD_URL" >> $GITHUB_ENV
+          echo "✅ File uploaded, ID: $FILE_ID"
+          echo "🔗 Download link: $DOWNLOAD_URL"
 
       - name: 🔗 Show download link
         run: |
-          echo "# 🚀 Download Link" >> $GITHUB_STEP_SUMMARY
-          echo "[Download from uupload.ir](${{ env.UPLOAD_LINK }})" >> $GITHUB_STEP_SUMMARY
+          echo "# 🚀 Download Link (Avalai)" >> $GITHUB_STEP_SUMMARY
+          echo "[Download from Avalai](${{ env.UPLOAD_LINK }})" >> $GITHUB_STEP_SUMMARY
