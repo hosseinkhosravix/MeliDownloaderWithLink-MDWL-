@@ -1,4 +1,4 @@
-name: 🎯 YouTube Downloader (Upload to uupload.ir)
+name: 🎯 YouTube Downloader (Upload)
 
 on:
   workflow_dispatch:
@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      contents: write   # still needed for checkout, but we won't push
+      contents: write   # required for checkout
 
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +126,6 @@ jobs:
               except: return str(n)
 
           def gv(vid):
-              """Get video info AND channel name from actual video data"""
               try:
                   r = subprocess.run(
                       ['yt-dlp', '--dump-json', '--no-warnings', '--no-check-certificate',
@@ -141,11 +140,9 @@ jobs:
                       duration = d.get('duration', 0)
                       channel_url = d.get('channel_url', '') or d.get('uploader_url', '')
                       handle = None
-                      # Try to get @handle from channel_url
                       if channel_url:
                           m = re.search(r'@([\w-]+)', channel_url)
                           if m: handle = m.group(1)
-                      # Fallback: use channel name as folder name
                       if not handle:
                           handle = safe_name(channel, 30) if channel and channel != 'Unknown' else None
                       return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
@@ -153,25 +150,18 @@ jobs:
               return ('Unknown', None, 0, None)
 
           def get_channel_from_url(url):
-              """Extract channel identifier from any YouTube URL"""
-              # Try @handle
               m = re.search(r'@([\w-]+)', url)
               if m: return m.group(1)
-              # Try channel/ID
               m = re.search(r'channel/([\w-]+)', url)
               if m: return m.group(1)
-              # Try c/name
               m = re.search(r'c/([\w-]+)', url)
               if m: return m.group(1)
-              # Try /user/name
               m = re.search(r'user/([\w-]+)', url)
               if m: return m.group(1)
               return None
 
           def get_channel_from_playlist(playlist_url):
-              """Get the actual channel name from a playlist by looking at its first video"""
               try:
-                  # Get first video from playlist
                   cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--playlist-end', '1',
                          '--no-warnings', '--no-check-certificate', playlist_url]
                   r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -181,28 +171,19 @@ jobs:
                       if vid:
                           _, _, _, handle = gv(vid)
                           if handle: return handle
-                      # Fallback to uploader/channel from flat data
                       ch = d.get('channel') or d.get('uploader') or d.get('uploader_id')
                       if ch: return safe_name(ch, 30)
               except: pass
               return None
 
           def gvl(u, n):
-              """Get video list - returns (videos, channel_folder_name)"""
-              # Step 1: Try to get channel from URL pattern
               channel_folder = get_channel_from_url(u)
-              
-              # Step 2: If playlist and no channel found, get from first video
               if not channel_folder and 'playlist' in u:
                   print(f'   🔍 Detecting channel from playlist...')
                   channel_folder = get_channel_from_playlist(u)
-              
-              # Step 3: Last resort
               if not channel_folder:
                   channel_folder = 'playlist_videos'
-              
               print(f'   📁 Folder: {channel_folder}_videos')
-              
               c = ['yt-dlp', '--flat-playlist', '--dump-json', '--no-warnings', '--no-check-certificate']
               if n > 0: c.extend(['--playlist-end', str(n)])
               c.append(u)
@@ -214,18 +195,14 @@ jobs:
                           d = json.loads(line)
                           vid = d.get('id', '')
                           if not vid: continue
-                          
                           title = d.get('title', 'Untitled')[:60]
                           print(f'   📊 [{len(v)+1}/{n}] {title}...')
-                          
                           ch, vw, dr, _ = gv(vid)
-                          
                           if not ch or ch == 'Unknown':
                               ch = (d.get('channel') or d.get('uploader') or 
                                     d.get('uploader_id') or d.get('creator') or 'Unknown')
                           if not vw: vw = d.get('view_count')
                           if not dr: dr = d.get('duration', 0)
-                          
                           v.append({
                               'id': vid, 't': title,
                               'u': f'https://youtube.com/watch?v={vid}',
@@ -237,7 +214,6 @@ jobs:
                       except Exception as e:
                           print(f'      ⚠️ Skip: {str(e)[:40]}')
                           continue
-              
               return v, channel_folder
 
           def mkidx(v, cn, cd):
@@ -246,14 +222,12 @@ jobs:
               inf = cd / 'info'
               inf.mkdir(parents=True, exist_ok=True)
               idxf = f'playlists/{cn}_{ts}.md'
-              
               m = (f'# 📺 {cn}\n\n**{datetime.now():%Y-%m-%d %H:%M}** | **{len(v)} videos**\n\n'
                    f'| # | Thumbnail | Title | Duration | Views |\n'
                    f'|---|-----------|-------|----------|-------|\n')
               for i, x in enumerate(v, 1):
                   dur_str = f'{x["dr"]//60}:{x["dr"]%60:02d}' if x['dr'] else '?'
                   m += f'| {i} | [<img src="{x["th"]}" width="80">]({x["u"]}) | [{x["t"]}]({x["u"]}) | {dur_str} | {x["v"]} |\n'
-              
               m += '\n---\n\n## 📝 Details\n\n'
               for i, x in enumerate(v, 1):
                   sn = f'v{i:03d}_{x["id"]}'
@@ -275,7 +249,6 @@ jobs:
                        f'![Thumbnail]({x["th"]})\n\n'
                        f'- **{dur_str}** | **{x["v"]}** views | **{x["c"]}**\n'
                        f'- 📄 [info/{sn}.md](info/{sn}.md)\n\n---\n\n')
-              
               Path(idxf).write_text(m)
               print(f'📄 Index: {idxf}')
               return idxf
@@ -285,7 +258,6 @@ jobs:
               p = {'url': u, 'os': 'linux', 'output': {'type': 'audio' if T == 'audio' else 'video', 'format': e}}
               if T == 'audio': p['audio'] = {'bitrate': f'{Q}k'}
               else: p['output']['quality'] = f'{Q}p'
-
               for retry in range(3):
                   if retry > 0:
                       print(f'   🔄 Retry {retry}/3...')
@@ -373,20 +345,15 @@ jobs:
               print(f'\n📋 Extracting videos...')
               v, cn = gvl(U, MX)
               if not v: print('❌ No videos found'); sys.exit(1)
-
               cd = Path(f'downloads/{cn}_videos')
               cd.mkdir(parents=True, exist_ok=True)
-
               print(f'\n📝 Creating index...')
               mkidx(v, cn, cd)
-
               ok, fl = [], []
               print(f'\n📥 Downloading {len(v)} videos...\n{"="*50}')
-              
               for i, x in enumerate(v, 1):
                   print(f'\n📥 [{i}/{len(v)}] {x["t"]}')
                   print(f'   Channel: {x["c"]} | Duration: {x["dr"]//60}m | Views: {x["v"]}')
-                  
                   result = dl_video(x['u'])
                   if result:
                       fp = cd / f'v{i:03d}_{x["id"]}.{result["e"]}'
@@ -401,11 +368,9 @@ jobs:
                   else:
                       print(f'   ❌ Conversion failed')
                       fl.append(x['t'])
-                  
                   if i < len(v): 
                       print(f'   ⏳ Waiting...')
                       time.sleep(2)
-
               Path('/tmp/meta.json').write_text(json.dumps({
                   'm': M, 'cd': str(cd), 'ok': len(ok), 'fl': len(fl), 'total': len(v)
               }))
@@ -415,14 +380,10 @@ jobs:
               print(f'{"="*50}')
 
           else:
-              # Single video mode
               vid_match = re.search(r'(?:v=|/)([\w-]{11})', U)
               vid = vid_match.group(1) if vid_match else 'x'
-              
-              # Get channel from the video itself
               ch, _, _, handle = gv(vid)
               cn = handle if handle else get_channel_from_url(U) or safe_name(ch, 30) or 'video'
-              
               result = dl_video(U)
               if result:
                   cd = Path(f'downloads/{cn}_videos')
@@ -434,12 +395,11 @@ jobs:
                       split_file(fp, SP)
               else:
                   print('❌ Failed'); sys.exit(1)
-          
           PYEOF
 
-      # ═══════════════════════════════════════════════
-      # REPLACEMENT: Upload instead of push
-      # ═══════════════════════════════════════════════
+      # ────────────────────────────────────────────
+      # REPLACEMENT: Upload instead of pushing
+      # ────────────────────────────────────────────
       - name: 📤 Package & Upload to uupload.ir
         run: |
           echo "📦 Creating archive..."
@@ -459,11 +419,11 @@ if r.status_code == 200:
         with open('/tmp/upload_link.txt', 'w') as lf:
             lf.write(link)
     else:
-        print('❌ Could not extract link. Response snippet:')
+        print('Could not extract link. Response snippet:')
         print(r.text[:500])
         exit(1)
 else:
-    print(f'❌ Upload failed with status {r.status_code}')
+    print(f'Upload failed with status {r.status_code}')
     exit(1)
 "
           UPLOAD_LINK=$(cat /tmp/upload_link.txt)
