@@ -1,0 +1,232 @@
+name: MeliDownloader (Upload to uupload.ir)
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "Download URLs (space separated)"
+        required: true
+      quality:
+        description: "YouTube quality (ignored for direct URLs)"
+        required: false
+        default: "best"
+        type: choice
+        options:
+          - "best"
+          - "2160"
+          - "1440"
+          - "1080"
+          - "720"
+          - "480"
+          - "360"
+          - "240"
+          - "144"
+      mode:
+        description: "normal or zip output"
+        default: "normal"
+      split:
+        description: "Split size in MB (0 = no split)"
+        default: "0"
+
+jobs:
+  downloader:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # still needed if you ever push, but we won't push now
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install required tools
+        run: |
+          sudo apt update
+          sudo apt install -y aria2 curl wget zip git jq
+          # install yt-dlp (official binary)
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+
+      - name: Prepare directories
+        run: |
+          mkdir -p downloads
+          mkdir -p temp
+          echo "${{ github.event.inputs.urls }}" | tr ' ' '\n' > urls.txt
+
+      # ---------- YouTube Downloader ----------
+      - name: Download YouTube videos
+        run: |
+          QUALITY="${{ github.event.inputs.quality }}"
+          YT_LIST=()
+          while IFS= read -r url; do
+            if echo "$url" | grep -qE 'youtube\.com|youtu\.be'; then
+              YT_LIST+=("$url")
+            fi
+          done < urls.txt
+
+          if [ ${#YT_LIST[@]} -gt 0 ]; then
+            echo "Found ${#YT_LIST[@]} YouTube URL(s)"
+            for yt_url in "${YT_LIST[@]}"; do
+              echo "Downloading: $yt_url"
+              case "$QUALITY" in
+                best)
+                  FORMAT="bestvideo+bestaudio/best"
+                  ;;
+                *)
+                  FORMAT="bestvideo[height<=$QUALITY]+bestaudio/best[height<=$QUALITY]"
+                  ;;
+              esac
+              yt-dlp \
+                --format "$FORMAT" \
+                --merge-output-format mp4 \
+                --output "downloads/%(title).200s.%(ext)s" \
+                --restrict-filenames \
+                --no-playlist \
+                "$yt_url"
+            done
+            grep -vE 'youtube\.com|youtu\.be' urls.txt > urls_nonyoutube.txt
+          else
+            echo "No YouTube URLs found"
+            cp urls.txt urls_nonyoutube.txt
+          fi
+
+      # ---------- Smart Download Engine ----------
+      - name: Smart Download Engine (Final Edition)
+        run: |
+          get_clean_name() {
+            RAW=$(basename "${1%%\?*}")
+            if [ -z "$RAW" ] || [ "$RAW" = "/" ]; then
+              echo "file_$(date +%s)"
+            else
+              echo "$RAW"
+            fi
+          }
+
+          smart_download() {
+            URL="$1"
+            FILE=$(get_clean_name "$URL")
+            echo "------------------------------------"
+            echo "Downloading: $URL"
+            echo "Target file: $FILE"
+            echo "------------------------------------"
+
+            for attempt in {1..15}; do
+              echo "Attempt $attempt"
+              aria2c \
+                --max-connection-per-server=16 \
+                --split=16 \
+                --min-split-size=1M \
+                --continue=true \
+                --auto-file-renaming=false \
+                --allow-overwrite=true \
+                -d downloads \
+                -o "$FILE" \
+                "$URL" && break
+
+              echo "aria2 failed → fallback to curl"
+              curl -L \
+                --retry 5 \
+                --retry-delay 4 \
+                --continue-at - \
+                -o "downloads/$FILE" \
+                "$URL" && break
+
+              echo "Waiting before retry..."
+              sleep $(( attempt * attempt ))
+            done
+
+            if [ ! -f "downloads/$FILE" ]; then
+              echo "ERROR: download failed after retries"
+              exit 1
+            fi
+
+            SIZE=$(stat -c%s "downloads/$FILE")
+            if [ "$SIZE" -lt 1500 ]; then
+              if grep -qi html "downloads/$FILE"; then
+                echo "HTML trap detected → switching to chunk mode"
+                rm -f "downloads/$FILE"
+                CHUNK=20000000
+                START=0
+                INDEX=0
+                while true; do
+                  END=$((START + CHUNK - 1))
+                  curl -L \
+                    -H "Range: bytes=$START-$END" \
+                    -o "temp/$FILE.part$INDEX" \
+                    "$URL"
+                  PARTSIZE=$(stat -c%s "temp/$FILE.part$INDEX")
+                  if [ "$PARTSIZE" -lt "$CHUNK" ]; then
+                    break
+                  fi
+                  START=$((END + 1))
+                  INDEX=$((INDEX + 1))
+                done
+                cat temp/$FILE.part* > downloads/$FILE
+                rm temp/$FILE.part*
+              fi
+            fi
+
+            echo "Finished: $FILE"
+            echo "------------------------------------"
+          }
+
+          INPUT_FILE="urls_nonyoutube.txt"
+          if [ ! -f "$INPUT_FILE" ]; then
+            INPUT_FILE="urls.txt"
+          fi
+
+          while read URL; do
+            smart_download "$URL"
+          done < "$INPUT_FILE"
+
+      # ---------- Zip if mode is 'zip' and no split ----------
+      - name: Create final archive
+        if: ${{ github.event.inputs.mode == 'zip' && github.event.inputs.split == '0' }}
+        run: |
+          if [ -d downloads ] && [ "$(ls -A downloads)" ]; then
+            zip -r final_package.zip downloads
+            echo "Created final_package.zip"
+          else
+            echo "No files to zip."
+          fi
+
+      # ---------- Split if requested ----------
+      - name: Split files
+        if: ${{ github.event.inputs.split != '0' }}
+        run: |
+          SIZE=${{ github.event.inputs.split }}
+          mkdir -p downloads_split
+          for f in downloads/*; do
+            split -b ${SIZE}M "$f" "downloads_split/$(basename $f).part_"
+          done
+          # Archive the split parts
+          zip -r final_package_split.zip downloads_split/
+
+      # ---------- UPLOAD TO uupload.ir (NO API KEY) ----------
+      - name: Upload to uupload.ir
+        run: |
+          # Determine which file to upload
+          if [ -f final_package.zip ]; then
+            UPLOAD_FILE="final_package.zip"
+          elif [ -f final_package_split.zip ]; then
+            UPLOAD_FILE="final_package_split.zip"
+          else
+            # No zip created (mode was 'normal' and no split)
+            # Zip the downloads folder now
+            zip -r final_package.zip downloads
+            UPLOAD_FILE="final_package.zip"
+          fi
+
+          echo "Uploading $UPLOAD_FILE to uupload.ir ..."
+          pip install pyuuploader
+          # pyuuploader will print the download link to stdout
+          UPLOAD_LINK=$(python -m pyuuploader "$UPLOAD_FILE")
+          echo "UPLOAD_LINK=$UPLOAD_LINK" >> $GITHUB_ENV
+          echo "✅ Upload successful! Link: $UPLOAD_LINK"
+
+      # ---------- Show link in job summary (clickable) ----------
+      - name: Add download link to summary
+        run: |
+          echo "# 🚀 Your Download is Ready" >> $GITHUB_STEP_SUMMARY
+          echo "[Download from uupload.ir](${{ env.UPLOAD_LINK }})" >> $GITHUB_STEP_SUMMARY
+
+      # ❌ Commit/push steps have been removed – no more pushing to GitHub!
