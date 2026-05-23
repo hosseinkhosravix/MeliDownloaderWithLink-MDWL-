@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      contents: write   # required for checkout
+      contents: write   # needed for checkout
 
     steps:
       - uses: actions/checkout@v4
@@ -75,12 +75,17 @@ jobs:
         run: |
           M="${{ github.event.inputs.mode }}"
           U="${{ github.event.inputs.url }}"
-          [[ "$M" == "channel" && "$U" != http* ]] && U="https://www.youtube.com/$([[ "$U" == @* ]] && echo "$U" || echo "@$U")"
+          if [ "$M" = "channel" ] && ! echo "$U" | grep -q "^http"; then
+            if echo "$U" | grep -q "^@"; then
+              U="https://www.youtube.com/$U"
+            else
+              U="https://www.youtube.com/@$U"
+            fi
+          fi
           echo "URL=$U" >> $GITHUB_OUTPUT
           echo "MODE=$M" >> $GITHUB_OUTPUT
 
       - name: 🎯 Download & Process
-        id: main
         env:
           MODE: ${{ steps.prep.outputs.MODE }}
           URL: ${{ steps.prep.outputs.URL }}
@@ -179,7 +184,7 @@ jobs:
           def gvl(u, n):
               channel_folder = get_channel_from_url(u)
               if not channel_folder and 'playlist' in u:
-                  print(f'   🔍 Detecting channel from playlist...')
+                  print('   🔍 Detecting channel from playlist...')
                   channel_folder = get_channel_from_playlist(u)
               if not channel_folder:
                   channel_folder = 'playlist_videos'
@@ -268,7 +273,7 @@ jobs:
                       d = rr.json()
                       su = d.get('statusUrl')
                       if not su: continue
-                      print(f'   ⏳ Converting...')
+                      print('   ⏳ Converting...')
                       for _ in range(60):
                           time.sleep(2)
                           try:
@@ -296,7 +301,7 @@ jobs:
                               done += len(chunk)
                               if total > 0 and done % (10*65536) == 0:
                                   print(f'\r   ⬇️ {done*100/total:.1f}%', end='')
-                      print(f'\r   ⬇️ 100.0%')
+                      print('\r   ⬇️ 100.0%')
                       return filepath.stat().st_size
               except Exception as e:
                   print(f'   ❌ Download error: {e}')
@@ -342,12 +347,12 @@ jobs:
               print(f'✅ {f}')
 
           elif M in ('playlist', 'channel'):
-              print(f'\n📋 Extracting videos...')
+              print('\n📋 Extracting videos...')
               v, cn = gvl(U, MX)
               if not v: print('❌ No videos found'); sys.exit(1)
               cd = Path(f'downloads/{cn}_videos')
               cd.mkdir(parents=True, exist_ok=True)
-              print(f'\n📝 Creating index...')
+              print('\n📝 Creating index...')
               mkidx(v, cn, cd)
               ok, fl = [], []
               print(f'\n📥 Downloading {len(v)} videos...\n{"="*50}')
@@ -363,13 +368,13 @@ jobs:
                           split_file(fp, SP)
                           ok.append(x['t'])
                       else:
-                          print(f'   ❌ Download failed')
+                          print('   ❌ Download failed')
                           fl.append(x['t'])
                   else:
-                      print(f'   ❌ Conversion failed')
+                      print('   ❌ Conversion failed')
                       fl.append(x['t'])
-                  if i < len(v): 
-                      print(f'   ⏳ Waiting...')
+                  if i < len(v):
+                      print('   ⏳ Waiting...')
                       time.sleep(2)
               Path('/tmp/meta.json').write_text(json.dumps({
                   'm': M, 'cd': str(cd), 'ok': len(ok), 'fl': len(fl), 'total': len(v)
@@ -397,9 +402,7 @@ jobs:
                   print('❌ Failed'); sys.exit(1)
           PYEOF
 
-      # ────────────────────────────────────────────
-      # REPLACEMENT: Upload instead of pushing
-      # ────────────────────────────────────────────
+      # --- Upload step (no more push) ---
       - name: 📤 Package & Upload to uupload.ir
         run: |
           echo "📦 Creating archive..."
