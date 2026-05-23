@@ -1,0 +1,508 @@
+name: 🏷️ MeliDL – Unified Downloader (Fixed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "🔗 URLs (space‑separated) – direct links and/or YouTube"
+        required: true
+      yt_type:
+        description: "🎬 YouTube output type"
+        required: false
+        type: choice
+        options: ['video', 'audio']
+        default: 'video'
+      yt_quality:
+        description: "🎯 YouTube quality (video: 144‑1080, audio: 128‑320)"
+        required: false
+        default: '720'
+      max_videos:
+        description: "🔢 Max YouTube results (playlist / channel / search)"
+        required: false
+        default: 10
+      split_mb:
+        description: "✂️ Split files > MB (0 = no split)"
+        required: false
+        default: 0
+
+jobs:
+  meli-dl:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # only needed for checkout, we don't push anymore
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system tools
+        run: |
+          sudo apt update -qq
+          sudo apt install -y aria2 curl wget zip git jq python3-pip
+          pip3 install -q requests
+
+      - name: Install yt-dlp
+        run: |
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+
+      - name: Prepare folders
+        run: |
+          mkdir -p downloads/direct
+          mkdir -p downloads/YouTube
+          echo "${{ github.event.inputs.urls }}" | tr ' ' '\n' > all_urls.txt
+
+      # ────────────────────────────────────────────────────────────────
+      # DIRECT LINK ENGINE (unchanged – exactly as you provided)
+      # ────────────────────────────────────────────────────────────────
+      - name: Smart Download Engine (direct links)
+        env:
+          SPLIT_MB: ${{ github.event.inputs.split_mb }}
+        run: |
+          grep -vE 'youtube\.com|youtu\.be' all_urls.txt > direct_urls.txt || true
+          if [ ! -s direct_urls.txt ]; then
+            echo "No direct URLs"
+            exit 0
+          fi
+
+          get_clean_name() {
+            RAW=$(basename "${1%%\?*}")
+            if [ -z "$RAW" ] || [ "$RAW" = "/" ]; then
+              echo "file_$(date +%s)"
+            else
+              echo "$RAW"
+            fi
+          }
+
+          smart_download() {
+            URL="$1"
+            FILE=$(get_clean_name "$URL")
+            echo "------------------------------------"
+            echo "📥 Direct: $FILE"
+            echo "------------------------------------"
+
+            for attempt in {1..15}; do
+              echo "Attempt $attempt"
+              aria2c \
+                --max-connection-per-server=16 \
+                --split=16 \
+                --min-split-size=1M \
+                --continue=true \
+                --auto-file-renaming=false \
+                --allow-overwrite=true \
+                -d downloads/direct \
+                -o "$FILE" \
+                "$URL" && break
+
+              echo "aria2 failed → curl"
+              curl -L \
+                --retry 5 \
+                --retry-delay 4 \
+                --continue-at - \
+                -o "downloads/direct/$FILE" \
+                "$URL" && break
+
+              sleep $(( attempt * attempt ))
+            done
+
+            if [ ! -f "downloads/direct/$FILE" ]; then
+              echo "❌ Download failed"
+              exit 1
+            fi
+
+            SIZE=$(stat -c%s "downloads/direct/$FILE")
+            if [ "$SIZE" -lt 1500 ]; then
+              if grep -qi html "downloads/direct/$FILE"; then
+                echo "HTML trap → chunk mode"
+                rm -f "downloads/direct/$FILE"
+                CHUNK=20000000
+                START=0
+                INDEX=0
+                while true; do
+                  END=$((START + CHUNK - 1))
+                  curl -L -H "Range: bytes=$START-$END" -o "temp/$FILE.part$INDEX" "$URL"
+                  PARTSIZE=$(stat -c%s "temp/$FILE.part$INDEX")
+                  if [ "$PARTSIZE" -lt "$CHUNK" ]; then
+                    break
+                  fi
+                  START=$((END + 1))
+                  INDEX=$((INDEX + 1))
+                done
+                cat temp/$FILE.part* > downloads/direct/$FILE
+                rm temp/$FILE.part*
+              fi
+            fi
+
+            # optional split
+            if [ "$SPLIT_MB" != "0" ]; then
+              SZ_MB=$(( $(stat -c%s "downloads/direct/$FILE") / 1048576 ))
+              if [ "$SZ_MB" -gt "$SPLIT_MB" ]; then
+                echo "✂️ Splitting ($SZ_MB MB)"
+                mkdir -p downloads/direct_split
+                split -b ${SPLIT_MB}M "downloads/direct/$FILE" "downloads/direct_split/${FILE}.part_"
+                rm "downloads/direct/$FILE"
+              fi
+            fi
+            echo "✅ $FILE"
+          }
+
+          while read URL; do
+            smart_download "$URL"
+          done < direct_urls.txt
+
+      # ────────────────────────────────────────────────────────────────
+      # YOUTUBE DOWNLOADER (fixed – uses yt‑dlp directly, no 3rd party API)
+      # ────────────────────────────────────────────────────────────────
+      - name: YouTube Downloader (yt‑dlp direct)
+        env:
+          YT_TYPE: ${{ github.event.inputs.yt_type }}
+          YT_QUALITY: ${{ github.event.inputs.yt_quality }}
+          MAX_VIDEOS: ${{ github.event.inputs.max_videos }}
+          SPLIT_MB: ${{ github.event.inputs.split_mb }}
+        run: |
+          grep -E 'youtube\.com|youtu\.be' all_urls.txt > yt_urls.txt || true
+          if [ ! -s yt_urls.txt ]; then
+            echo "No YouTube URLs"
+            exit 0
+          fi
+
+          while read URL; do
+            echo "🎬 Processing YouTube: $URL"
+
+            # Auto-detect mode
+            if [[ "$URL" == *"list="* || "$URL" == *"playlist"* ]]; then
+              MODE="playlist"
+            elif [[ "$URL" == *"/channel/"* || "$URL" == *"/c/"* || "$URL" == *"/user/"* || "$URL" == *"@"* ]]; then
+              MODE="channel"
+            else
+              MODE="single"
+            fi
+            echo "   Mode: $MODE"
+
+            export YT_URL="$URL"
+            export MODE="$MODE"
+            # (YT_TYPE, YT_QUALITY, MAX_VIDEOS, SPLIT_MB are already in env)
+
+            python3 << 'PYEOF'
+import os, json, time, re, subprocess, sys, hashlib
+from pathlib import Path
+from datetime import datetime
+
+MODE = os.environ['MODE']
+URL = os.environ['YT_URL']
+TYPE = os.environ['YT_TYPE']          # video / audio
+QUALITY = os.environ.get('YT_QUALITY', '720')
+MAX_VIDEOS = int(os.environ.get('MAX_VIDEOS', '10'))
+SPLIT_MB = int(os.environ.get('SPLIT_MB', '0'))
+
+def safe_name(text, maxlen=40):
+    safe = re.sub(r'[^\w]', '_', text)[:maxlen]
+    safe = re.sub(r'_+', '_', safe).strip('_')
+    if not safe:
+        safe = hashlib.md5(text.encode()).hexdigest()[:8]
+    return safe
+
+def format_num(n):
+    if not n: return 'N/A'
+    try:
+        n = int(n)
+        return f'{n/1e6:.1f}M' if n >= 1e6 else f'{n/1e3:.1f}K' if n >= 1e3 else str(n)
+    except: return str(n)
+
+def get_video_info(vid):
+    try:
+        r = subprocess.run(
+            ['yt-dlp', '--dump-json', '--no-warnings', '--no-check-certificate',
+             f'https://youtube.com/watch?v={vid}'],
+            capture_output=True, text=True, timeout=15
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            d = json.loads(r.stdout)
+            channel = d.get('channel') or d.get('uploader') or d.get('uploader_id') or d.get('creator') or 'Unknown'
+            views = d.get('view_count')
+            duration = d.get('duration', 0)
+            channel_url = d.get('channel_url', '') or d.get('uploader_url', '')
+            handle = None
+            if channel_url:
+                m = re.search(r'@([\w-]+)', channel_url)
+                if m: handle = m.group(1)
+            if not handle:
+                handle = safe_name(channel, 30) if channel and channel != 'Unknown' else None
+            return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
+    except: pass
+    return ('Unknown', None, 0, None)
+
+def get_channel_from_url(url):
+    m = re.search(r'@([\w-]+)', url)
+    if m: return m.group(1)
+    m = re.search(r'channel/([\w-]+)', url)
+    if m: return m.group(1)
+    m = re.search(r'c/([\w-]+)', url)
+    if m: return m.group(1)
+    m = re.search(r'user/([\w-]+)', url)
+    if m: return m.group(1)
+    return None
+
+def get_channel_from_playlist(playlist_url):
+    try:
+        cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--playlist-end', '1',
+               '--no-warnings', '--no-check-certificate', playlist_url]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if r.returncode == 0 and r.stdout.strip():
+            d = json.loads(r.stdout.strip().split('\n')[0])
+            vid = d.get('id', '')
+            if vid:
+                _, _, _, handle = get_video_info(vid)
+                if handle: return handle
+            ch = d.get('channel') or d.get('uploader') or d.get('uploader_id')
+            if ch: return safe_name(ch, 30)
+    except: pass
+    return None
+
+def get_video_list(url, n):
+    channel_folder = get_channel_from_url(url)
+    if not channel_folder and 'playlist' in url:
+        print('   🔍 Detecting channel from playlist...')
+        channel_folder = get_channel_from_playlist(url)
+    if not channel_folder:
+        channel_folder = 'playlist_videos'
+    print(f'   📁 Folder: {channel_folder}_videos')
+
+    cmd = ['yt-dlp', '--flat-playlist', '--dump-json', '--no-warnings', '--no-check-certificate']
+    if n > 0: cmd.extend(['--playlist-end', str(n)])
+    cmd.append(url)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    videos = []
+    for line in r.stdout.strip().split('\n'):
+        if line and len(videos) < n:
+            try:
+                d = json.loads(line)
+                vid = d.get('id', '')
+                if not vid: continue
+                title = d.get('title', 'Untitled')[:60]
+                ch, vw, dr, _ = get_video_info(vid)
+                if not ch or ch == 'Unknown':
+                    ch = d.get('channel') or d.get('uploader') or d.get('uploader_id') or d.get('creator') or 'Unknown'
+                if not vw: vw = d.get('view_count')
+                if not dr: dr = d.get('duration', 0)
+                videos.append({
+                    'id': vid, 'title': title,
+                    'url': f'https://youtube.com/watch?v={vid}',
+                    'duration': int(dr) if dr else 0,
+                    'thumbnail': f'https://i.ytimg.com/vi/{vid}/maxresdefault.jpg',
+                    'channel': str(ch).strip() if ch else 'Unknown',
+                    'views': format_num(vw)
+                })
+            except Exception as e:
+                print(f'      ⚠️ Skip: {str(e)[:40]}')
+                continue
+    return videos, channel_folder
+
+def create_index(videos, channel_name, output_dir):
+    ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    Path('./playlists').mkdir(exist_ok=True)
+    info_dir = output_dir / 'info'
+    info_dir.mkdir(parents=True, exist_ok=True)
+    idx_file = f'playlists/{channel_name}_{ts}.md'
+
+    md = (f'# 📺 {channel_name}\n\n**{datetime.now():%Y-%m-%d %H:%M}** | **{len(videos)} videos**\n\n'
+          f'| # | Thumbnail | Title | Duration | Views |\n'
+          f'|---|-----------|-------|----------|-------|\n')
+    for i, v in enumerate(videos, 1):
+        dur_str = f'{v["duration"]//60}:{v["duration"]%60:02d}' if v['duration'] else '?'
+        md += f'| {i} | [<img src="{v["thumbnail"]}" width="80">]({v["url"]}) | [{v["title"]}]({v["url"]}) | {dur_str} | {v["views"]} |\n'
+    md += '\n---\n\n## 📝 Details\n\n'
+    for i, v in enumerate(videos, 1):
+        sn = f'v{i:03d}_{v["id"]}'
+        info_md = (f'# 🎬 {v["title"]}\n\n![Thumbnail]({v["thumbnail"]})\n\n'
+                   f'## Info\n\n'
+                   f'| Property | Value |\n|----------|-------|\n'
+                   f'| **Channel** | {v["channel"]} |\n'
+                   f'| **Duration** | {v["duration"]//60}m |\n'
+                   f'| **Views** | {v["views"]} |\n'
+                   f'| **Video ID** | `{v["id"]}` |\n'
+                   f'| **URL** | {v["url"]} |\n\n'
+                   f'<img src="{v["thumbnail"]}" width="640">\n\n'
+                   f'---\n*Downloaded: {datetime.now():%Y-%m-%d %H:%M}*')
+        (info_dir / f'{sn}.md').write_text(info_md)
+        md += (f'### {i}. {v["title"]}\n\n'
+               f'![Thumbnail]({v["thumbnail"]})\n\n'
+               f'- **{dur_str}** | **{v["views"]}** views | **{v["channel"]}**\n'
+               f'- 📄 [info/{sn}.md](info/{sn}.md)\n\n---\n\n')
+    Path(idx_file).write_text(md)
+    print(f'📄 Index: {idx_file}')
+
+def download_video_ytdlp(video_url, output_template, quality, audio_only=False):
+    """Download directly with yt-dlp (no external API)."""
+    if audio_only:
+        format_str = 'bestaudio/best'
+        cmd = [
+            'yt-dlp', '-f', format_str,
+            '--extract-audio', '--audio-format', 'mp3',
+            '--audio-quality', quality,
+            '-o', output_template,
+            '--no-warnings', '--no-check-certificate',
+            video_url
+        ]
+    else:
+        format_str = f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best'
+        cmd = [
+            'yt-dlp', '-f', format_str,
+            '--merge-output-format', 'mp4',
+            '-o', output_template,
+            '--no-warnings', '--no-check-certificate',
+            video_url
+        ]
+    try:
+        subprocess.run(cmd, check=True, timeout=600)
+        return True
+    except Exception as e:
+        print(f'   ❌ yt-dlp error: {e}')
+        return False
+
+# ── Main download logic ──
+if MODE in ('playlist', 'channel'):
+    print('📋 Extracting videos...')
+    videos, channel = get_video_list(URL, MAX_VIDEOS)
+    if not videos:
+        print('❌ No videos found')
+        sys.exit(1)
+    out_dir = Path(f'downloads/YouTube/{channel}_videos')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    create_index(videos, channel, out_dir)
+
+    ok = 0
+    for i, vid in enumerate(videos, 1):
+        print(f'\n📥 [{i}/{len(videos)}] {vid["title"]}')
+        output_template = str(out_dir / f'v{i:03d}_{vid["id"]}.%(ext)s')
+        if TYPE == 'audio':
+            success = download_video_ytdlp(vid['url'], output_template, QUALITY, audio_only=True)
+        else:
+            success = download_video_ytdlp(vid['url'], output_template, QUALITY, audio_only=False)
+
+        if success:
+            # yt-dlp will create the file with correct extension
+            expected_ext = 'mp3' if TYPE == 'audio' else 'mp4'
+            expected = out_dir / f'v{i:03d}_{vid["id"]}.{expected_ext}'
+            if expected.exists():
+                size = expected.stat().st_size
+                print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
+                if SPLIT_MB > 0 and size/1e6 > SPLIT_MB:
+                    print(f'   ✂️ Splitting...')
+                    name = expected.name
+                    subprocess.run(['zip', '-r', '-q', '-s', f'{SPLIT_MB}m', f'{name}.zip', name],
+                                   cwd=expected.parent, check=True)
+                    expected.unlink()
+                    parts = sorted(expected.parent.glob(f'{name}.z*'))
+                    print(f'   ✅ Split into {len(parts)} parts')
+                ok += 1
+            else:
+                print('   ❌ File not found after download')
+        else:
+            print('   ❌ Download failed')
+        time.sleep(2)
+    print(f'\n📊 {ok}/{len(videos)} downloaded successfully')
+
+elif MODE == 'single':
+    vid_match = re.search(r'(?:v=|/)([\w-]{11})', URL)
+    vid = vid_match.group(1) if vid_match else 'x'
+    ch, _, _, handle = get_video_info(vid)
+    channel = handle if handle else get_channel_from_url(URL) or safe_name(ch, 30) or 'video'
+    out_dir = Path(f'downloads/YouTube/{channel}_videos')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_template = str(out_dir / f'v_{vid}.%(ext)s')
+    if TYPE == 'audio':
+        success = download_video_ytdlp(URL, output_template, QUALITY, audio_only=True)
+    else:
+        success = download_video_ytdlp(URL, output_template, QUALITY, audio_only=False)
+
+    if success:
+        expected_ext = 'mp3' if TYPE == 'audio' else 'mp4'
+        expected = out_dir / f'v_{vid}.{expected_ext}'
+        if expected.exists():
+            size = expected.stat().st_size
+            print(f'✅ Saved to {channel}_videos/ ({size/1e6:.1f}MB)')
+            if SPLIT_MB > 0 and size/1e6 > SPLIT_MB:
+                print(f'   ✂️ Splitting...')
+                name = expected.name
+                subprocess.run(['zip', '-r', '-q', '-s', f'{SPLIT_MB}m', f'{name}.zip', name],
+                               cwd=expected.parent, check=True)
+                expected.unlink()
+                parts = sorted(expected.parent.glob(f'{name}.z*'))
+                print(f'   ✅ Split into {len(parts)} parts')
+        else:
+            print('❌ File not found')
+    else:
+        print('❌ Download failed')
+
+elif MODE == 'search':
+    videos, _ = get_video_list(f'ytsearch{MAX_VIDEOS}:{URL}', MAX_VIDEOS)
+    if not videos:
+        print('❌ No results')
+        sys.exit(1)
+    ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    Path('./searches').mkdir(exist_ok=True)
+    qs = safe_name(URL, 30)
+    f = f'searches/{qs}_{ts}.md'
+    md = (f'# 🔍 Search: {URL}\n\n**{datetime.now():%Y-%m-%d %H:%M}** | **{len(videos)} results**\n\n'
+          f'| # | Thumbnail | Title | Channel | Views | Duration |\n'
+          f'|---|-----------|-------|---------|-------|----------|\n')
+    for i, v in enumerate(videos, 1):
+        md += f'| {i} | [<img src="{v["thumbnail"]}" width="80">]({v["url"]}) | [{v["title"]}]({v["url"]}) | {v["channel"][:20]} | {v["views"]} | {v["duration"]//60}m |\n'
+    md += '\n---\n\n'
+    for i, v in enumerate(videos, 1):
+        md += (f'### {i}. {v["title"]}\n\n<img src="{v["thumbnail"]}" width="640">\n\n'
+               f'| Property | Value |\n|----------|-------|\n'
+               f'| Channel | {v["channel"]} |\n| Duration | {v["duration"]//60}m |\n'
+               f'| Views | {v["views"]} |\n| ID | `{v["id"]}` |\n| URL | {v["url"]} |\n\n---\n\n')
+    Path(f).write_text(md)
+    print(f'✅ Search index: {f}')
+PYEOF
+          done < yt_urls.txt
+
+      # ────────────────────────────────────────────────────────────────
+      # PACKAGE & UPLOAD
+      # ────────────────────────────────────────────────────────────────
+      - name: Package everything
+        run: |
+          cd downloads
+          if [ -d direct ] && [ "$(ls -A direct 2>/dev/null)" ]; then
+            mv direct/* . 2>/dev/null || true
+          fi
+          if [ -d YouTube ] && [ "$(ls -A YouTube 2>/dev/null)" ]; then
+            cp -r YouTube/* . 2>/dev/null || true
+          fi
+          cd ..
+          zip -r melidl_package.zip downloads/ playlists/ searches/ 2>/dev/null || echo "Only downloads folder"
+
+      - name: Upload to uupload.ir
+        run: |
+          python3 -c "
+import requests, re
+filepath = 'melidl_package.zip'
+print('Uploading to uupload.ir ...')
+with open(filepath, 'rb') as f:
+    r = requests.post('https://uupload.ir/', files={'file': (filepath, f)})
+
+if r.status_code == 200:
+    match = re.search(r'https?://[^\"]*uupload\.ir/[^\"]*', r.text)
+    if match:
+        link = match.group(0)
+        print(f'UPLOAD_LINK={link}')
+        with open('/tmp/upload_link.txt', 'w') as lf:
+            lf.write(link)
+    else:
+        print('Could not auto-detect link. Full response:')
+        print(r.text[:500])
+else:
+    print(f'Upload failed with status {r.status_code}')
+    exit(1)
+"
+          UPLOAD_LINK=$(cat /tmp/upload_link.txt)
+          echo "UPLOAD_LINK=$UPLOAD_LINK" >> $GITHUB_ENV
+          echo "✅ Uploaded: $UPLOAD_LINK"
+
+      - name: Show download link
+        run: |
+          echo "# 🚀 Download Link" >> $GITHUB_STEP_SUMMARY
+          echo "[Download from uupload.ir](${{ env.UPLOAD_LINK }})" >> $GITHUB_STEP_SUMMARY
