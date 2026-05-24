@@ -1,4 +1,4 @@
-name: 🎯 YouTube Downloader (Avalai Upload)
+name: 🎯 YouTube Downloader (Google Drive)
 
 on:
   workflow_dispatch:
@@ -39,7 +39,7 @@ on:
         description: '📦 Split > MB (0=no)'
         required: false
         type: number
-        default: 0   # We skip splitting for Avalai, but keep input for compatibility
+        default: 0   # We won't split for Google Drive
 
 env:
   PYTHONUNBUFFERED: '1'
@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      contents: write   # still needed for checkout
+      contents: write   # needed for checkout
 
     steps:
       - uses: actions/checkout@v4
@@ -105,7 +105,7 @@ jobs:
           T = os.environ['TYPE']
           Q = os.environ.get('QUALITY', '720')
           MX = int(os.environ.get('MAX', '10'))
-          SP = int(os.environ.get('SPLIT', '0'))   # we'll ignore splitting for Avalai
+          SP = int(os.environ.get('SPLIT', '0'))   # we won't split for Google Drive
 
           API = 'https://hub.ytconvert.org/api/download'
           H = {
@@ -387,35 +387,96 @@ jobs:
                   print('❌ Failed'); sys.exit(1)
           PYEOF
 
-      # ─────────────── Package & Upload to Avalai ───────────────
-      - name: 📤 Package & Upload to Avalai
+      # ─────────────── Package & Upload to Google Drive ───────────────
+      - name: 📤 Upload to Google Drive
         env:
-          AVALAI_API_KEY: ${{ secrets.AVALAI_API_KEY }}
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
         run: |
           echo "📦 Creating zip..."
           zip -r meli_dl.zip downloads/ playlists/ searches/ 2>/dev/null || echo "Only downloads folder zipped"
 
-          echo "⬆️ Uploading to Avalai..."
-          RESPONSE=$(curl -s -X POST "https://api.avalai.ir/v1/files" \
-            -H "Authorization: Bearer $AVALAI_API_KEY" \
-            -F "purpose=assistants" \
-            -F "file=@meli_dl.zip")
+          echo "⬆️ Uploading to Google Drive..."
+          python3 << 'UPLOADEOF'
+          import json, os, sys, requests
 
-          echo "Avalai response: $RESPONSE"
+          # Load service account key
+          sa_key = json.loads(os.environ['GDRIVE_SA_KEY'])
 
-          FILE_ID=$(echo "$RESPONSE" | jq -r '.id')
-          if [ -z "$FILE_ID" ] || [ "$FILE_ID" = "null" ]; then
-            echo "❌ Upload failed: no file ID"
-            exit 1
-          fi
+          # Build JWT and get access token
+          import jwt
+          import time
+          now = int(time.time())
+          jwt_claim = {
+              "iss": sa_key["client_email"],
+              "scope": "https://www.googleapis.com/auth/drive",
+              "aud": "https://oauth2.googleapis.com/token",
+              "iat": now,
+              "exp": now + 3600
+          }
+          signed_jwt = jwt.encode(jwt_claim, sa_key["private_key"], algorithm="RS256")
+          token_resp = requests.post(
+              "https://oauth2.googleapis.com/token",
+              data={
+                  "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                  "assertion": signed_jwt
+              }
+          )
+          access_token = token_resp.json()["access_token"]
 
-          # Build the download URL (content endpoint)
-          DOWNLOAD_URL="https://api.avalai.ir/v1/files/$FILE_ID/content"
-          echo "UPLOAD_LINK=$DOWNLOAD_URL" >> $GITHUB_ENV
-          echo "✅ File uploaded, ID: $FILE_ID"
-          echo "🔗 Download link: $DOWNLOAD_URL"
+          # Upload file
+          file_path = "meli_dl.zip"
+          file_name = "meli_dl.zip"
+          metadata = {
+              "name": file_name,
+              "parents": []  # root folder; optionally specify a folder ID
+          }
+          headers = {"Authorization": f"Bearer {access_token}"}
+          with open(file_path, "rb") as f:
+              resp = requests.post(
+                  "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+                  headers=headers,
+                  files={
+                      "metadata": ("metadata", json.dumps(metadata), "application/json"),
+                      "file": (file_name, f, "application/zip")
+                  }
+              )
+          if resp.status_code != 200:
+              print(f"Upload failed: {resp.text}")
+              sys.exit(1)
+
+          file_id = resp.json()["id"]
+          print(f"File ID: {file_id}")
+
+          # Make file publicly accessible
+          perms_resp = requests.post(
+              f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions",
+              headers=headers,
+              json={
+                  "role": "reader",
+                  "type": "anyone"
+              }
+          )
+          if perms_resp.status_code == 200:
+              print("Set to public")
+          else:
+              print(f"Permission set failed: {perms_resp.text}")
+
+          # Get shareable link
+          file_meta = requests.get(
+              f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=webViewLink,webContentLink",
+              headers=headers
+          ).json()
+          download_link = file_meta.get("webContentLink") or file_meta.get("webViewLink")
+          print(f"DOWNLOAD_LINK={download_link}")
+          with open("/tmp/gdrive_link.txt", "w") as f:
+              f.write(download_link)
+          UPLOADEOF
+
+          DOWNLOAD_LINK=$(cat /tmp/gdrive_link.txt)
+          echo "UPLOAD_LINK=$DOWNLOAD_LINK" >> $GITHUB_ENV
+          echo "✅ Google Drive link: $DOWNLOAD_LINK"
 
       - name: 🔗 Show download link
         run: |
-          echo "# 🚀 Download Link (Avalai)" >> $GITHUB_STEP_SUMMARY
-          echo "[Download from Avalai](${{ env.UPLOAD_LINK }})" >> $GITHUB_STEP_SUMMARY
+          echo "# 🚀 Download Link" >> $GITHUB_STEP_SUMMARY
+          echo "[Download from Google Drive](${{ env.UPLOAD_LINK }})" >> $GITHUB_STEP_SUMMARY
